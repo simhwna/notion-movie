@@ -5,9 +5,13 @@
   1. imdb.com/chart/top 의 JSON-LD, __NEXT_DATA__, DOM
   2. top250.info/charts 표
 
-노션 속성은 스키마를 읽어 타입을 확인한 뒤에만 사용한다. 숫자 타입이 아닌 속성에는 쓰지 않기
-때문에 한 속성 당한 것 때문에 전증이 거부되는 상황을 피한다. 쓰기는 속성별로 나눠 재시도한다.
-사용자가 직접 매긴 별점을 건드리지 않도록 IMDb가 이름에 없는 속성은 후보에서 제외한다.
+한국어 제목은 위키데이터 SPARQL로 IMDb ID별 ko 라벨을 받아 채운다. 별도 키가 필요 없고
+실패해도 전체 실행을 막지 않는다. 받은 값은 titleKo 로 캐시 파일에 함께 저장한다.
+
+노션 속성은 스키마를 읽어 타입을 확인한 뒤에만 사용한다. 숫자 타입이 아닌 속성에는 값을 쓰지
+않으므로 속성 하나 때문에 요청 전체가 거부되는 일이 없다. 쓰기가 실패하면 속성별로 나눠 다시
+시도한다. 사용자가 직접 매긴 별점을 건드리지 않도록 이름에 imdb 가 없는 숫자 속성은 후보에서
+제외한다.
 
 환경 변수
   NOTION_TOKEN           노션 내부 통합 토큰
@@ -31,6 +35,8 @@ from bs4 import BeautifulSoup
 IMDB_CHART_URL = 'https://www.imdb.com/chart/top/'
 INFO_CHART_URLS = ('https://top250.info/charts', 'http://top250.info/charts')
 OMDB_URL = 'https://www.omdbapi.com/'
+WIKIDATA_URL = 'https://query.wikidata.org/sparql'
+WIKIDATA_CHUNK = 125
 OUT_PATH = Path('data/top250.json')
 NOTION_API = 'https://api.notion.com/v1'
 NOTION_VERSION = '2025-09-03'
@@ -44,6 +50,11 @@ BROWSER_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
     'Accept-Language': 'en-US,en;q=0.9',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+}
+
+WIKIDATA_HEADERS = {
+    'User-Agent': 'notion-movie/1.0 (https://github.com/simhwna/notion-movie)',
+    'Accept': 'application/sparql-results+json',
 }
 
 fail_logged = 0
@@ -256,6 +267,37 @@ def collect_chart():
     raise SystemExit('250건을 얻지 못했다. 파일을 덮어쓰지 않고 종료한다')
 
 
+def fetch_ko_titles(entries):
+    mapping = {}
+    ids = [entry['imdbId'] for entry in entries]
+    for start in range(0, len(ids), WIKIDATA_CHUNK):
+        chunk = ids[start:start + WIKIDATA_CHUNK]
+        values = ' '.join('"' + imdb_id + '"' for imdb_id in chunk)
+        query = (
+            'SELECT ?imdb ?label WHERE { VALUES ?imdb { ' + values + ' } '
+            '?item wdt:P345 ?imdb . ?item rdfs:label ?label . '
+            'FILTER(lang(?label) = "ko") }'
+        )
+        try:
+            with httpx.Client(headers=WIKIDATA_HEADERS, timeout=90.0, follow_redirects=True) as client:
+                response = client.post(WIKIDATA_URL, data={'query': query, 'format': 'json'})
+            if response.status_code != 200:
+                log('위키데이터 상태 {0}'.format(response.status_code))
+                continue
+            rows = response.json().get('results', {}).get('bindings', [])
+        except (httpx.HTTPError, ValueError) as error:
+            log('위키데이터 조회 실패 {0}'.format(error))
+            continue
+        for row in rows:
+            imdb_id = row.get('imdb', {}).get('value')
+            label = row.get('label', {}).get('value')
+            if imdb_id and label and imdb_id not in mapping:
+                mapping[imdb_id] = label
+        time.sleep(1.0)
+    log('한국어 제목 {0}건 확보'.format(len(mapping)))
+    return mapping
+
+
 def write_cache(entries):
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(entries, ensure_ascii=False, indent=2) + '\n'
@@ -334,17 +376,36 @@ def normalize_title(value):
     return re.sub(r'[^0-9a-z가-힣]+', '', (value or '').lower())
 
 
+def entry_title_keys(entry):
+    keys = []
+    for value in (entry.get('title'), entry.get('titleKo')):
+        key = normalize_title(value)
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def row_title_keys(value):
+    base = (value or '').strip()
+    trimmed = re.sub(r'\s*[\(\[]?\d{4}[\)\]]?\s*$', '', base)
+    keys = []
+    for candidate in (base, trimmed):
+        key = normalize_title(candidate)
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
 def unique_title_index(entries):
     counts = {}
     for entry in entries:
-        key = normalize_title(entry.get('title'))
-        if key:
+        for key in entry_title_keys(entry):
             counts[key] = counts.get(key, 0) + 1
     index = {}
     for entry in entries:
-        key = normalize_title(entry.get('title'))
-        if key and counts.get(key) == 1:
-            index[key] = entry
+        for key in entry_title_keys(entry):
+            if counts.get(key) == 1:
+                index[key] = entry
     return index
 
 
@@ -391,6 +452,7 @@ def sync_notion(entries):
 
     by_id = {entry['imdbId']: entry for entry in entries}
     by_title = unique_title_index(entries)
+    log('제목 색인 {0}개'.format(len(by_title)))
     matched_id = 0
     matched_title = 0
     unmatched = []
@@ -429,10 +491,12 @@ def sync_notion(entries):
                 if entry is not None:
                     matched_id += 1
                 if entry is None and title:
-                    entry = by_title.get(normalize_title(title))
-                    if entry is not None:
-                        matched_title += 1
-                        imdb_id = entry['imdbId']
+                    for key in row_title_keys(title):
+                        entry = by_title.get(key)
+                        if entry is not None:
+                            matched_title += 1
+                            imdb_id = entry['imdbId']
+                            break
                 if entry is None and title and len(unmatched) < 12:
                     unmatched.append(title)
 
@@ -467,6 +531,11 @@ def sync_notion(entries):
 
 def main():
     entries = collect_chart()
+    ko_titles = fetch_ko_titles(entries)
+    for entry in entries:
+        ko_title = ko_titles.get(entry['imdbId'])
+        if ko_title:
+            entry['titleKo'] = ko_title
     write_cache(entries)
     try:
         sync_notion(entries)
