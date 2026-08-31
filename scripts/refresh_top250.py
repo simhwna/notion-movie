@@ -5,26 +5,24 @@
   1. imdb.com/chart/top 의 JSON-LD, __NEXT_DATA__, DOM
   2. top250.info/charts 표
 
-한국어 제목은 위키데이터 SPARQL로 IMDb ID별 ko 라벨을 받아 채운다. 별도 키가 필요 없고
-실패해도 전체 실행을 막지 않는다. 받은 값은 titleKo 로 캐시 파일에 함께 저장한다.
+한국어 제목은 위키데이터 SPARQL 로 IMDb ID 별 ko 라벨과 ko 별칭을 받아서 총읍한다.
+제목으로 짝을 못 찾은 노션 행은 위키데이터 검색 API 로 되짚어 IMDb ID 를 찾는다.
 
-노션 속성은 스키마를 읽어 타입을 확인한 뒤에만 사용한다. 숫자 타입이 아닌 속성에는 값을 쓰지
-않으므로 속성 하나 때문에 요청 전체가 거부되는 일이 없다. 쓰기가 실패하면 속성별로 나눠 다시
-시도한다. 사용자가 직접 매긴 별점을 건드리지 않도록 이름에 imdb 가 없는 숫자 속성은 후보에서
-제외한다.
+사운 끝에 data/sync-report.json 에 맞춘 결과와 남은 행 목록을 쓰고 원경에 올린다.
 
 환경 변수
   NOTION_TOKEN           노션 내부 통합 토큰
-  NOTION_DATA_SOURCE_ID  Movies DB의 data source id
+  NOTION_DATA_SOURCE_ID  Movies DB 의 data source id
   OMDB_API_KEY           OMDb 키. 없으면 차트에 없는 영화의 평점 조회를 건너뛴다
 
-250건을 얻지 못하면 파일을 덮어쓰지 않고 종료 코드 1로 끝낸다.
+250건을 얻지 못하면 파일을 덮어쓰지 않고 종료 코드 1로 끝난다.
 '''
 from __future__ import annotations
 
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -36,15 +34,30 @@ IMDB_CHART_URL = 'https://www.imdb.com/chart/top/'
 INFO_CHART_URLS = ('https://top250.info/charts', 'http://top250.info/charts')
 OMDB_URL = 'https://www.omdbapi.com/'
 WIKIDATA_URL = 'https://query.wikidata.org/sparql'
+WIKIDATA_API = 'https://www.wikidata.org/w/api.php'
 WIKIDATA_CHUNK = 125
 OUT_PATH = Path('data/top250.json')
+REPORT_PATH = Path('data/sync-report.json')
 NOTION_API = 'https://api.notion.com/v1'
 NOTION_VERSION = '2025-09-03'
 NOTION_GAP = 0.4
 OMDB_GAP = 0.25
 OMDB_MAX_CALLS = 200
+WD_GAP = 0.3
+WD_MAX_LOOKUPS = 120
 EXPECTED = 250
 FAIL_LOG_LIMIT = 5
+CACHE_KEYS = ('rank', 'imdbId', 'title', 'rating', 'titleKo')
+
+
+def hangul(cho, jung, jong=0):
+    return chr(0xAC00 + (cho * 21 + jung) * 28 + jong)
+
+
+HANGUL_RANGE = chr(0xAC00) + '-' + chr(0xD7A3)
+TOKEN_RANK = hangul(9, 13, 4) + hangul(11, 16)
+TOKEN_RATING = hangul(17, 6, 21) + hangul(12, 4, 16)
+NORMALIZE_RE = re.compile('[^0-9a-z' + HANGUL_RANGE + ']+')
 
 BROWSER_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -55,6 +68,11 @@ BROWSER_HEADERS = {
 WIKIDATA_HEADERS = {
     'User-Agent': 'notion-movie/1.0 (https://github.com/simhwna/notion-movie)',
     'Accept': 'application/sparql-results+json',
+}
+
+WD_API_HEADERS = {
+    'User-Agent': 'notion-movie/1.0 (https://github.com/simhwna/notion-movie)',
+    'Accept': 'application/json',
 }
 
 fail_logged = 0
@@ -69,9 +87,9 @@ def fetch_html(url):
         with httpx.Client(headers=BROWSER_HEADERS, timeout=30.0, follow_redirects=True) as client:
             response = client.get(url)
     except httpx.HTTPError as error:
-        log('요청 실패 {0} {1}'.format(url, error))
+        log('http fail {0} {1}'.format(url, error))
         return None
-    log('요청 {0} 상태 {1} 분량 {2}'.format(url, response.status_code, len(response.text)))
+    log('http {0} status {1} size {2}'.format(url, response.status_code, len(response.text)))
     if response.status_code != 200:
         return None
     return response.text
@@ -233,10 +251,10 @@ def collect_from_imdb():
     parsers = (('JSON-LD', parse_json_ld), ('NEXT_DATA', parse_next_data), ('DOM', parse_dom))
     for name, parser in parsers:
         found = dedupe(parser(soup))
-        log('IMDb {0} 파싱 결과 {1}건'.format(name, len(found)))
+        log('imdb {0} parsed {1}'.format(name, len(found)))
         if name == 'DOM' and len(found) > EXPECTED:
             found = dedupe(found[:EXPECTED])
-            log('DOM 결과를 상위 250건으로 자른다')
+            log('dom trimmed to 250')
         if len(found) == EXPECTED:
             return found
     return []
@@ -248,7 +266,7 @@ def collect_from_info():
         if not html:
             continue
         found = dedupe(parse_top250_info(html))
-        log('top250.info 파싱 결과 {0}건'.format(len(found)))
+        log('top250.info parsed {0}'.format(len(found)))
         if len(found) == EXPECTED:
             return found
     return []
@@ -257,55 +275,71 @@ def collect_from_info():
 def collect_chart():
     found = collect_from_imdb()
     if found:
-        log('IMDb 원본에서 250건 확보')
+        log('chart source imdb ok 250')
         return found
-    log('IMDb 원본 실패. 폴백 소스로 전환한다')
+    log('imdb source failed, switching to fallback')
     found = collect_from_info()
     if found:
-        log('top250.info에서 250건 확보')
+        log('chart source top250.info ok 250')
         return found
-    raise SystemExit('250건을 얻지 못했다. 파일을 덮어쓰지 않고 종료한다')
+    raise SystemExit('could not collect 250 entries, keeping the old cache file')
 
 
 def fetch_ko_titles(entries):
-    mapping = {}
+    labels = {}
+    alts = {}
     ids = [entry['imdbId'] for entry in entries]
     for start in range(0, len(ids), WIKIDATA_CHUNK):
         chunk = ids[start:start + WIKIDATA_CHUNK]
         values = ' '.join('"' + imdb_id + '"' for imdb_id in chunk)
         query = (
-            'SELECT ?imdb ?label WHERE { VALUES ?imdb { ' + values + ' } '
-            '?item wdt:P345 ?imdb . ?item rdfs:label ?label . '
-            'FILTER(lang(?label) = "ko") }'
+            'SELECT ?imdb ?label ?alt WHERE { VALUES ?imdb { ' + values + ' } '
+            '?item wdt:P345 ?imdb . '
+            'OPTIONAL { ?item rdfs:label ?label . FILTER(lang(?label) = "ko") } '
+            'OPTIONAL { ?item skos:altLabel ?alt . FILTER(lang(?alt) = "ko") } }'
         )
         try:
             with httpx.Client(headers=WIKIDATA_HEADERS, timeout=90.0, follow_redirects=True) as client:
                 response = client.post(WIKIDATA_URL, data={'query': query, 'format': 'json'})
             if response.status_code != 200:
-                log('위키데이터 상태 {0}'.format(response.status_code))
+                log('wikidata sparql status {0}'.format(response.status_code))
                 continue
             rows = response.json().get('results', {}).get('bindings', [])
         except (httpx.HTTPError, ValueError) as error:
-            log('위키데이터 조회 실패 {0}'.format(error))
+            log('wikidata sparql failed {0}'.format(error))
             continue
         for row in rows:
             imdb_id = row.get('imdb', {}).get('value')
+            if not imdb_id:
+                continue
             label = row.get('label', {}).get('value')
-            if imdb_id and label and imdb_id not in mapping:
-                mapping[imdb_id] = label
+            if label and imdb_id not in labels:
+                labels[imdb_id] = label
+            alt = row.get('alt', {}).get('value')
+            if alt:
+                bucket = alts.setdefault(imdb_id, [])
+                if alt not in bucket:
+                    bucket.append(alt)
         time.sleep(1.0)
-    log('한국어 제목 {0}건 확보'.format(len(mapping)))
-    return mapping
+    log('ko labels {0}, entries with ko alias {1}'.format(len(labels), len(alts)))
+    return labels, alts
 
 
 def write_cache(entries):
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(entries, ensure_ascii=False, indent=2) + '\n'
+    trimmed = []
+    for entry in entries:
+        item = {}
+        for key in CACHE_KEYS:
+            if key in entry:
+                item[key] = entry[key]
+        trimmed.append(item)
+    payload = json.dumps(trimmed, ensure_ascii=False, indent=2) + '\n'
     if OUT_PATH.exists() and OUT_PATH.read_text(encoding='utf-8') == payload:
-        log('top250.json 변경 없음')
+        log('top250.json unchanged')
         return False
     OUT_PATH.write_text(payload, encoding='utf-8')
-    log('top250.json 갱신 {0}건'.format(len(entries)))
+    log('top250.json written {0}'.format(len(trimmed)))
     return True
 
 
@@ -358,7 +392,7 @@ def number_value(prop):
 
 
 def normalize_key(value):
-    return re.sub(r'[^0-9a-z가-힣]+', '', (value or '').lower())
+    return NORMALIZE_RE.sub('', (value or '').lower())
 
 
 def pick_property(schema, kinds, tokens):
@@ -373,12 +407,14 @@ def pick_property(schema, kinds, tokens):
 
 
 def normalize_title(value):
-    return re.sub(r'[^0-9a-z가-힣]+', '', (value or '').lower())
+    return NORMALIZE_RE.sub('', (value or '').lower())
 
 
 def entry_title_keys(entry):
     keys = []
-    for value in (entry.get('title'), entry.get('titleKo')):
+    candidates = [entry.get('title'), entry.get('titleKo')]
+    candidates.extend(entry.get('_koAlts') or [])
+    for value in candidates:
         key = normalize_title(value)
         if key and key not in keys:
             keys.append(key)
@@ -396,17 +432,68 @@ def row_title_keys(value):
     return keys
 
 
-def unique_title_index(entries):
+def title_key_counts(entries):
     counts = {}
     for entry in entries:
         for key in entry_title_keys(entry):
             counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def unique_title_index(entries):
+    counts = title_key_counts(entries)
     index = {}
     for entry in entries:
         for key in entry_title_keys(entry):
             if counts.get(key) == 1:
                 index[key] = entry
     return index
+
+
+def duplicate_keys(entries):
+    counts = title_key_counts(entries)
+    return sorted(key for key in counts if counts[key] > 1)
+
+
+def wikidata_lookup(client, title):
+    try:
+        response = client.get(WIKIDATA_API, params={
+            'action': 'wbsearchentities',
+            'search': title,
+            'language': 'ko',
+            'uselang': 'ko',
+            'type': 'item',
+            'limit': 5,
+            'format': 'json',
+        })
+        if response.status_code != 200:
+            return []
+        candidates = [item.get('id') for item in response.json().get('search', []) if item.get('id')]
+    except (httpx.HTTPError, ValueError):
+        return []
+    if not candidates:
+        return []
+    try:
+        detail = client.get(WIKIDATA_API, params={
+            'action': 'wbgetentities',
+            'ids': '|'.join(candidates),
+            'props': 'claims',
+            'format': 'json',
+        })
+        if detail.status_code != 200:
+            return []
+        entities = detail.json().get('entities', {})
+    except (httpx.HTTPError, ValueError):
+        return []
+    found = []
+    for qid in candidates:
+        claims = (entities.get(qid) or {}).get('claims', {})
+        for claim in claims.get('P345', []):
+            snak = claim.get('mainsnak') or {}
+            value = (snak.get('datavalue') or {}).get('value')
+            if isinstance(value, str) and value.startswith('tt') and value not in found:
+                found.append(value)
+    return found
 
 
 def fetch_omdb_rating(client, imdb_id, api_key):
@@ -427,7 +514,7 @@ def patch_page(client, page_id, payload, title):
         return True
     if fail_logged < FAIL_LOG_LIMIT:
         fail_logged += 1
-        log('갱신 실패 {0} {1} {2}'.format(title, response.status_code, response.text[:300]))
+        log('patch failed {0} {1} {2}'.format(title, response.status_code, response.text[:300]))
     if len(payload) < 2:
         return False
     succeeded = False
@@ -438,7 +525,7 @@ def patch_page(client, page_id, payload, title):
             succeeded = True
         elif fail_logged < FAIL_LOG_LIMIT:
             fail_logged += 1
-            log('단일 갱신 실패 {0} {1} {2}'.format(name, single.status_code, single.text[:300]))
+            log('single patch failed {0} {1} {2}'.format(name, single.status_code, single.text[:300]))
     return succeeded
 
 
@@ -447,58 +534,104 @@ def sync_notion(entries):
     data_source_id = os.environ.get('NOTION_DATA_SOURCE_ID', '').strip()
     omdb_key = os.environ.get('OMDB_API_KEY', '').strip()
     if not token or not data_source_id:
-        log('노션 키가 없어 노션 갱신을 건너뛴다')
-        return
+        log('notion keys missing, skipping notion sync')
+        return None
 
     by_id = {entry['imdbId']: entry for entry in entries}
     by_title = unique_title_index(entries)
-    log('제목 색인 {0}개'.format(len(by_title)))
-    matched_id = 0
-    matched_title = 0
-    unmatched = []
-    updated = 0
+    log('title index size {0}'.format(len(by_title)))
+
+    report = {
+        'rows': 0,
+        'matchedById': 0,
+        'matchedByTitle': 0,
+        'matchedByWikidata': 0,
+        'updated': 0,
+        'unmatchedRows': [],
+        'outsideChartRows': [],
+        'chartMissingKoTitle': [
+            {'rank': entry['rank'], 'title': entry.get('title')}
+            for entry in entries if not entry.get('titleKo')
+        ],
+        'duplicateTitleKeys': duplicate_keys(entries),
+        'chartEntriesNotMatched': [],
+    }
+
+    matched_ids = set()
+    resolved = {}
+    wd_calls = 0
     omdb_calls = 0
+    updated = 0
 
     with notion_client(token) as client:
         schema = load_schema(client, data_source_id)
-        log('스키마 속성 {0}개'.format(len(schema)))
+        log('schema properties {0}'.format(len(schema)))
         for name in sorted(schema):
             definition = schema[name] if isinstance(schema[name], dict) else {}
-            log('  속성 {0} 타입 {1}'.format(name, definition.get('type')))
+            log('  property {0} type {1}'.format(name, definition.get('type')))
 
         title_prop = pick_property(schema, ('title',), ())
-        rank_prop = pick_property(schema, ('number',), ('imdb', '순위'))
-        rating_prop = pick_property(schema, ('number',), ('imdb', '평점'))
+        rank_prop = pick_property(schema, ('number',), ('imdb', TOKEN_RANK))
+        rating_prop = pick_property(schema, ('number',), ('imdb', TOKEN_RATING))
         imdb_prop = pick_property(schema, ('rich_text', 'url'), ('imdb', 'id'))
-        log('감지 제목 {0} 순위 {1} 평점 {2} 아이디 {3}'.format(title_prop, rank_prop, rating_prop, imdb_prop))
+        log('tokens {0} {1}'.format(TOKEN_RANK, TOKEN_RATING))
+        log('detected title {0} rank {1} rating {2} imdbId {3}'.format(title_prop, rank_prop, rating_prop, imdb_prop))
+        report['properties'] = {
+            'title': title_prop,
+            'rank': rank_prop,
+            'rating': rating_prop,
+            'imdbId': imdb_prop,
+        }
 
         if rank_prop is None and rating_prop is None:
-            log('숫자 타입의 IMDb 속성을 찾지 못했다. 위 속성 목록을 확인해야 한다')
-            return
+            log('no number property matched the imdb tokens, check the property list above')
+            return report
 
         rows = query_rows(client, data_source_id)
-        log('노션 행 {0}건 조회'.format(len(rows)))
+        report['rows'] = len(rows)
+        log('notion rows {0}'.format(len(rows)))
 
-        with httpx.Client(timeout=20.0) as omdb:
+        with httpx.Client(timeout=20.0) as omdb, httpx.Client(headers=WD_API_HEADERS, timeout=30.0, follow_redirects=True) as wd:
             for index, row in enumerate(rows, start=1):
                 props = row.get('properties', {})
                 page_id = row.get('id')
                 title = plain_text(props.get(title_prop)) if title_prop else ''
                 raw_id = plain_text(props.get(imdb_prop)) if imdb_prop else ''
                 imdb_id = imdb_id_from_url(raw_id) or ''
+                outside = False
 
                 entry = by_id.get(imdb_id) if imdb_id else None
                 if entry is not None:
-                    matched_id += 1
+                    report['matchedById'] += 1
                 if entry is None and title:
                     for key in row_title_keys(title):
                         entry = by_title.get(key)
                         if entry is not None:
-                            matched_title += 1
+                            report['matchedByTitle'] += 1
                             imdb_id = entry['imdbId']
                             break
-                if entry is None and title and len(unmatched) < 12:
-                    unmatched.append(title)
+                if entry is None and title and wd_calls < WD_MAX_LOOKUPS:
+                    found = resolved.get(title)
+                    if found is None:
+                        found = wikidata_lookup(wd, title)
+                        resolved[title] = found
+                        wd_calls += 1
+                        time.sleep(WD_GAP)
+                    for candidate in found:
+                        if candidate in by_id:
+                            entry = by_id[candidate]
+                            imdb_id = candidate
+                            report['matchedByWikidata'] += 1
+                            break
+                    if entry is None and found:
+                        outside = True
+                        if not imdb_id:
+                            imdb_id = found[0]
+                        report['outsideChartRows'].append({'title': title, 'imdbId': found[0]})
+                if entry is not None:
+                    matched_ids.add(entry['imdbId'])
+                elif title and not outside:
+                    report['unmatchedRows'].append(title)
 
                 payload = {}
                 if rank_prop:
@@ -521,27 +654,71 @@ def sync_notion(entries):
                     updated += 1
 
                 if index % 50 == 0:
-                    log('진행 {0}/{1} 갱신 {2}건'.format(index, len(rows), updated))
+                    log('progress {0}/{1} updated {2}'.format(index, len(rows), updated))
 
-    log('아이디 일치 {0}건 제목 일치 {1}건'.format(matched_id, matched_title))
-    if unmatched:
-        log('짝을 못 찾은 제목 예시 ' + ' / '.join(unmatched))
-    log('노션 {0}건 갱신, OMDb 호출 {1}회'.format(updated, omdb_calls))
+    report['updated'] = updated
+    report['wikidataLookups'] = wd_calls
+    report['omdbCalls'] = omdb_calls
+    report['chartEntriesNotMatched'] = [
+        {'rank': entry['rank'], 'title': entry.get('title'), 'titleKo': entry.get('titleKo')}
+        for entry in entries if entry['imdbId'] not in matched_ids
+    ]
+
+    log('matched by id {0}, by title {1}, by wikidata {2}'.format(
+        report['matchedById'], report['matchedByTitle'], report['matchedByWikidata']))
+    log('unmatched rows {0}, rows outside the chart {1}'.format(
+        len(report['unmatchedRows']), len(report['outsideChartRows'])))
+    if report['unmatchedRows']:
+        log('unmatched sample ' + ' / '.join(report['unmatchedRows'][:12]))
+    log('chart entries with no notion row {0}'.format(len(report['chartEntriesNotMatched'])))
+    log('notion updated {0}, omdb calls {1}, wikidata lookups {2}'.format(updated, omdb_calls, wd_calls))
+    return report
+
+
+def write_report(report):
+    REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(report, ensure_ascii=False, indent=2) + '\n'
+    REPORT_PATH.write_text(payload, encoding='utf-8')
+    log('sync-report.json written')
+
+
+def commit_report():
+    if not os.environ.get('GITHUB_ACTIONS'):
+        return
+    commands = [
+        ['git', 'add', '-f', str(REPORT_PATH)],
+        ['git', '-c', 'user.name=github-actions[bot]',
+         '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com',
+         'commit', '-m', 'chore: sync report'],
+        ['git', 'push'],
+    ]
+    for command in commands:
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            log('git step failed {0} {1}'.format(' '.join(command[:2]), (result.stderr or result.stdout)[:200]))
+            return
+    log('sync-report.json pushed')
 
 
 def main():
     entries = collect_chart()
-    ko_titles = fetch_ko_titles(entries)
+    labels, alts = fetch_ko_titles(entries)
     for entry in entries:
-        ko_title = ko_titles.get(entry['imdbId'])
-        if ko_title:
-            entry['titleKo'] = ko_title
+        label = labels.get(entry['imdbId'])
+        if label:
+            entry['titleKo'] = label
+        bucket = alts.get(entry['imdbId'])
+        if bucket:
+            entry['_koAlts'] = bucket
     write_cache(entries)
     try:
-        sync_notion(entries)
+        report = sync_notion(entries)
     except httpx.HTTPStatusError as error:
-        log('노션 요청 실패 {0} {1}'.format(error.response.status_code, error.response.text[:300]))
+        log('notion request failed {0} {1}'.format(error.response.status_code, error.response.text[:300]))
         return 1
+    if report:
+        write_report(report)
+        commit_report()
     return 0
 
 
