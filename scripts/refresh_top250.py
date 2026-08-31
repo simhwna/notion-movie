@@ -3,14 +3,18 @@
 
 수집 우선순위
   1. imdb.com/chart/top 의 JSON-LD, __NEXT_DATA__, DOM
-  2. top250.info/charts 표. IMDb가 클라우드 아이프를 막을 때 사용한다
+  2. top250.info/charts 표
+
+노션 속성은 스키마를 읽어 타입을 확인한 뒤에만 사용한다. 숫자 타입이 아닌 속성에는 쓰지 않기
+때문에 한 속성 당한 것 때문에 전증이 거부되는 상황을 피한다. 쓰기는 속성별로 나눠 재시도한다.
+사용자가 직접 매긴 별점을 건드리지 않도록 IMDb가 이름에 없는 속성은 후보에서 제외한다.
 
 환경 변수
   NOTION_TOKEN           노션 내부 통합 토큰
   NOTION_DATA_SOURCE_ID  Movies DB의 data source id
   OMDB_API_KEY           OMDb 키. 없으면 차트에 없는 영화의 평점 조회를 건너뛴다
 
-모든 경로에서 250건을 얻지 못하면 파일을 덮어쓰지 않고 종료 코드 1로 끝낸다.
+250건을 얻지 못하면 파일을 덮어쓰지 않고 종료 코드 1로 끝낸다.
 '''
 from __future__ import annotations
 
@@ -34,6 +38,7 @@ NOTION_GAP = 0.4
 OMDB_GAP = 0.25
 OMDB_MAX_CALLS = 200
 EXPECTED = 250
+FAIL_LOG_LIMIT = 5
 
 BROWSER_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -41,10 +46,7 @@ BROWSER_HEADERS = {
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
 }
 
-PROP_RANK = 'IMDb 순위 숫자'
-PROP_RATING = 'IMDb 평점'
-PROP_IMDB_ID = 'IMDb ID'
-PROP_TITLE = '제목'
+fail_logged = 0
 
 
 def log(message):
@@ -219,13 +221,13 @@ def collect_from_imdb():
     soup = BeautifulSoup(html, 'html.parser')
     parsers = (('JSON-LD', parse_json_ld), ('NEXT_DATA', parse_next_data), ('DOM', parse_dom))
     for name, parser in parsers:
-        entries = dedupe(parser(soup))
-        log('IMDb {0} 파싱 결과 {1}건'.format(name, len(entries)))
-        if name == 'DOM' and len(entries) > EXPECTED:
-            entries = dedupe(entries[:EXPECTED])
+        found = dedupe(parser(soup))
+        log('IMDb {0} 파싱 결과 {1}건'.format(name, len(found)))
+        if name == 'DOM' and len(found) > EXPECTED:
+            found = dedupe(found[:EXPECTED])
             log('DOM 결과를 상위 250건으로 자른다')
-        if len(entries) == EXPECTED:
-            return entries
+        if len(found) == EXPECTED:
+            return found
     return []
 
 
@@ -234,23 +236,23 @@ def collect_from_info():
         html = fetch_html(url)
         if not html:
             continue
-        entries = dedupe(parse_top250_info(html))
-        log('top250.info 파싱 결과 {0}건'.format(len(entries)))
-        if len(entries) == EXPECTED:
-            return entries
+        found = dedupe(parse_top250_info(html))
+        log('top250.info 파싱 결과 {0}건'.format(len(found)))
+        if len(found) == EXPECTED:
+            return found
     return []
 
 
 def collect_chart():
-    entries = collect_from_imdb()
-    if entries:
+    found = collect_from_imdb()
+    if found:
         log('IMDb 원본에서 250건 확보')
-        return entries
+        return found
     log('IMDb 원본 실패. 폴백 소스로 전환한다')
-    entries = collect_from_info()
-    if entries:
+    found = collect_from_info()
+    if found:
         log('top250.info에서 250건 확보')
-        return entries
+        return found
     raise SystemExit('250건을 얻지 못했다. 파일을 덮어쓰지 않고 종료한다')
 
 
@@ -303,12 +305,29 @@ def query_rows(client, data_source_id):
 def plain_text(prop):
     if not isinstance(prop, dict):
         return ''
+    if isinstance(prop.get('url'), str):
+        return prop['url'].strip()
     parts = prop.get('rich_text') or prop.get('title') or []
     return ''.join(part.get('plain_text', '') for part in parts).strip()
 
 
 def number_value(prop):
     return prop.get('number') if isinstance(prop, dict) else None
+
+
+def normalize_key(value):
+    return re.sub(r'[^0-9a-z가-힣]+', '', (value or '').lower())
+
+
+def pick_property(schema, kinds, tokens):
+    for name in schema:
+        definition = schema[name]
+        if not isinstance(definition, dict) or definition.get('type') not in kinds:
+            continue
+        key = normalize_key(name)
+        if all(token in key for token in tokens):
+            return name
+    return None
 
 
 def normalize_title(value):
@@ -339,6 +358,29 @@ def fetch_omdb_rating(client, imdb_id, api_key):
     return to_float(response.json().get('imdbRating'))
 
 
+def patch_page(client, page_id, payload, title):
+    global fail_logged
+    response = client.patch('/pages/' + page_id, json={'properties': payload})
+    time.sleep(NOTION_GAP)
+    if response.status_code < 400:
+        return True
+    if fail_logged < FAIL_LOG_LIMIT:
+        fail_logged += 1
+        log('갱신 실패 {0} {1} {2}'.format(title, response.status_code, response.text[:300]))
+    if len(payload) < 2:
+        return False
+    succeeded = False
+    for name in list(payload):
+        single = client.patch('/pages/' + page_id, json={'properties': {name: payload[name]}})
+        time.sleep(NOTION_GAP)
+        if single.status_code < 400:
+            succeeded = True
+        elif fail_logged < FAIL_LOG_LIMIT:
+            fail_logged += 1
+            log('단일 갱신 실패 {0} {1} {2}'.format(name, single.status_code, single.text[:300]))
+    return succeeded
+
+
 def sync_notion(entries):
     token = os.environ.get('NOTION_TOKEN', '').strip()
     data_source_id = os.environ.get('NOTION_DATA_SOURCE_ID', '').strip()
@@ -349,52 +391,77 @@ def sync_notion(entries):
 
     by_id = {entry['imdbId']: entry for entry in entries}
     by_title = unique_title_index(entries)
+    matched_id = 0
+    matched_title = 0
+    unmatched = []
     updated = 0
     omdb_calls = 0
 
     with notion_client(token) as client:
         schema = load_schema(client, data_source_id)
-        has_rank = PROP_RANK in schema
-        has_rating = PROP_RATING in schema
-        if not has_rank and not has_rating:
-            log('갱신할 속성이 스키마에 없다')
+        log('스키마 속성 {0}개'.format(len(schema)))
+        for name in sorted(schema):
+            definition = schema[name] if isinstance(schema[name], dict) else {}
+            log('  속성 {0} 타입 {1}'.format(name, definition.get('type')))
+
+        title_prop = pick_property(schema, ('title',), ())
+        rank_prop = pick_property(schema, ('number',), ('imdb', '순위'))
+        rating_prop = pick_property(schema, ('number',), ('imdb', '평점'))
+        imdb_prop = pick_property(schema, ('rich_text', 'url'), ('imdb', 'id'))
+        log('감지 제목 {0} 순위 {1} 평점 {2} 아이디 {3}'.format(title_prop, rank_prop, rating_prop, imdb_prop))
+
+        if rank_prop is None and rating_prop is None:
+            log('숫자 타입의 IMDb 속성을 찾지 못했다. 위 속성 목록을 확인해야 한다')
             return
+
         rows = query_rows(client, data_source_id)
         log('노션 행 {0}건 조회'.format(len(rows)))
 
         with httpx.Client(timeout=20.0) as omdb:
-            for row in rows:
+            for index, row in enumerate(rows, start=1):
                 props = row.get('properties', {})
                 page_id = row.get('id')
-                imdb_id = plain_text(props.get(PROP_IMDB_ID))
-                title = plain_text(props.get(PROP_TITLE))
+                title = plain_text(props.get(title_prop)) if title_prop else ''
+                raw_id = plain_text(props.get(imdb_prop)) if imdb_prop else ''
+                imdb_id = imdb_id_from_url(raw_id) or ''
+
                 entry = by_id.get(imdb_id) if imdb_id else None
+                if entry is not None:
+                    matched_id += 1
                 if entry is None and title:
                     entry = by_title.get(normalize_title(title))
+                    if entry is not None:
+                        matched_title += 1
+                        imdb_id = entry['imdbId']
+                if entry is None and title and len(unmatched) < 12:
+                    unmatched.append(title)
 
                 payload = {}
-                if has_rank:
+                if rank_prop:
                     desired_rank = entry['rank'] if entry else None
-                    if number_value(props.get(PROP_RANK)) != desired_rank:
-                        payload[PROP_RANK] = {'number': desired_rank}
-                if has_rating:
+                    if number_value(props.get(rank_prop)) != desired_rank:
+                        payload[rank_prop] = {'number': desired_rank}
+                if rating_prop:
                     desired_rating = entry.get('rating') if entry else None
                     if desired_rating is None and imdb_id and omdb_key and omdb_calls < OMDB_MAX_CALLS:
                         desired_rating = fetch_omdb_rating(omdb, imdb_id, omdb_key)
                         omdb_calls += 1
                         time.sleep(OMDB_GAP)
-                    if desired_rating is not None and number_value(props.get(PROP_RATING)) != desired_rating:
-                        payload[PROP_RATING] = {'number': desired_rating}
-                if not payload:
-                    continue
+                    if desired_rating is not None and number_value(props.get(rating_prop)) != desired_rating:
+                        payload[rating_prop] = {'number': desired_rating}
+                if imdb_prop and imdb_id and not raw_id:
+                    if schema.get(imdb_prop, {}).get('type') == 'rich_text':
+                        payload[imdb_prop] = {'rich_text': [{'type': 'text', 'text': {'content': imdb_id}}]}
 
-                response = client.patch('/pages/' + page_id, json={'properties': payload})
-                time.sleep(NOTION_GAP)
-                if response.status_code >= 400:
-                    log('갱신 실패 {0} {1} {2}'.format(title, response.status_code, response.text[:200]))
-                    continue
-                updated += 1
+                if payload and patch_page(client, page_id, payload, title):
+                    updated += 1
 
+                if index % 50 == 0:
+                    log('진행 {0}/{1} 갱신 {2}건'.format(index, len(rows), updated))
+
+    log('아이디 일치 {0}건 제목 일치 {1}건'.format(matched_id, matched_title))
+    if unmatched:
+        log('짝을 못 찾은 제목 예시 ' + ' / '.join(unmatched))
     log('노션 {0}건 갱신, OMDb 호출 {1}회'.format(updated, omdb_calls))
 
 
@@ -404,7 +471,7 @@ def main():
     try:
         sync_notion(entries)
     except httpx.HTTPStatusError as error:
-        log('노션 요청 실패 {0} {1}'.format(error.response.status_code, error.response.text[:200]))
+        log('노션 요청 실패 {0} {1}'.format(error.response.status_code, error.response.text[:300]))
         return 1
     return 0
 
