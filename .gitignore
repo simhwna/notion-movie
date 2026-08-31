@@ -1,18 +1,19 @@
-# Android / Gradle
-*.iml
+# Android Studio and Gradle
 .gradle/
-local.properties
-.idea/
-.DS_Store
 build/
+app/build/
+.idea/
+*.iml
+local.properties
 captures/
-.externalNativeBuild/
 .cxx/
-*.apk
-*.aab
-*.keystore
+.externalNativeBuild/
 
 # Python
 __pycache__/
 *.pyc
 .venv/
+
+# OS
+.DS_Store
+Thumbs.db
