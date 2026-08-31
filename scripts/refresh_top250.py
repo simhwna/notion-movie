@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 '''IMDb Top 250을 갱신해 data/top250.json에 저장하고 노션 Movies DB의 순위와 평점을 맞춘다.
 
+수집 우선순위
+  1. imdb.com/chart/top 의 JSON-LD, __NEXT_DATA__, DOM
+  2. top250.info/charts 표. IMDb가 클라우드 아이프를 막을 때 사용한다
+
 환경 변수
   NOTION_TOKEN           노션 내부 통합 토큰
   NOTION_DATA_SOURCE_ID  Movies DB의 data source id
   OMDB_API_KEY           OMDb 키. 없으면 차트에 없는 영화의 평점 조회를 건너뛴다
 
-파싱 결과가 250건이 아니면 파일을 덮어쓰지 않고 종료 코드 1로 끝낸다.
+모든 경로에서 250건을 얻지 못하면 파일을 덮어쓰지 않고 종료 코드 1로 끝낸다.
 '''
 from __future__ import annotations
 
@@ -20,7 +24,8 @@ from pathlib import Path
 import httpx
 from bs4 import BeautifulSoup
 
-CHART_URL = 'https://www.imdb.com/chart/top/'
+IMDB_CHART_URL = 'https://www.imdb.com/chart/top/'
+INFO_CHART_URLS = ('https://top250.info/charts', 'http://top250.info/charts')
 OMDB_URL = 'https://www.omdbapi.com/'
 OUT_PATH = Path('data/top250.json')
 NOTION_API = 'https://api.notion.com/v1'
@@ -46,11 +51,17 @@ def log(message):
     print(message, flush=True)
 
 
-def fetch_chart_html():
-    with httpx.Client(headers=BROWSER_HEADERS, timeout=30.0, follow_redirects=True) as client:
-        response = client.get(CHART_URL)
-        response.raise_for_status()
-        return response.text
+def fetch_html(url):
+    try:
+        with httpx.Client(headers=BROWSER_HEADERS, timeout=30.0, follow_redirects=True) as client:
+            response = client.get(url)
+    except httpx.HTTPError as error:
+        log('요청 실패 {0} {1}'.format(url, error))
+        return None
+    log('요청 {0} 상태 {1} 분량 {2}'.format(url, response.status_code, len(response.text)))
+    if response.status_code != 200:
+        return None
+    return response.text
 
 
 def imdb_id_from_url(url):
@@ -157,6 +168,38 @@ def parse_dom(soup):
     return entries
 
 
+def parse_top250_info(html):
+    soup = BeautifulSoup(html, 'html.parser')
+    entries = []
+    seen = set()
+    for row in soup.find_all('tr'):
+        link = row.find('a', href=re.compile(r'/movie/\?\d+'))
+        if link is None:
+            continue
+        match = re.search(r'/movie/\?(\d+)', link.get('href', ''))
+        if match is None:
+            continue
+        number = match.group(1)
+        imdb_id = 'tt' + (number if len(number) >= 7 else number.zfill(7))
+        if imdb_id in seen:
+            continue
+        rank = None
+        rating = None
+        for cell in row.find_all('td'):
+            text = cell.get_text(' ', strip=True)
+            if rank is None and re.fullmatch(r'\d{1,3}', text):
+                rank = int(text)
+                continue
+            if rating is None and re.fullmatch(r'\d{1,2}\.\d', text):
+                rating = float(text)
+        if rank is None:
+            continue
+        title = re.sub(r'\s*\(\d{4}\)\s*$', '', link.get_text(' ', strip=True))
+        seen.add(imdb_id)
+        entries.append({'rank': rank, 'imdbId': imdb_id, 'title': title, 'rating': rating})
+    return entries
+
+
 def dedupe(entries):
     best = {}
     for entry in entries:
@@ -169,17 +212,45 @@ def dedupe(entries):
     return ordered
 
 
-def collect_chart():
-    soup = BeautifulSoup(fetch_chart_html(), 'html.parser')
+def collect_from_imdb():
+    html = fetch_html(IMDB_CHART_URL)
+    if not html:
+        return []
+    soup = BeautifulSoup(html, 'html.parser')
     parsers = (('JSON-LD', parse_json_ld), ('NEXT_DATA', parse_next_data), ('DOM', parse_dom))
     for name, parser in parsers:
         entries = dedupe(parser(soup))
-        log('{0} 파싱 결과 {1}건'.format(name, len(entries)))
+        log('IMDb {0} 파싱 결과 {1}건'.format(name, len(entries)))
         if name == 'DOM' and len(entries) > EXPECTED:
-            entries = entries[:EXPECTED]
+            entries = dedupe(entries[:EXPECTED])
             log('DOM 결과를 상위 250건으로 자른다')
         if len(entries) == EXPECTED:
             return entries
+    return []
+
+
+def collect_from_info():
+    for url in INFO_CHART_URLS:
+        html = fetch_html(url)
+        if not html:
+            continue
+        entries = dedupe(parse_top250_info(html))
+        log('top250.info 파싱 결과 {0}건'.format(len(entries)))
+        if len(entries) == EXPECTED:
+            return entries
+    return []
+
+
+def collect_chart():
+    entries = collect_from_imdb()
+    if entries:
+        log('IMDb 원본에서 250건 확보')
+        return entries
+    log('IMDb 원본 실패. 폴백 소스로 전환한다')
+    entries = collect_from_info()
+    if entries:
+        log('top250.info에서 250건 확보')
+        return entries
     raise SystemExit('250건을 얻지 못했다. 파일을 덮어쓰지 않고 종료한다')
 
 
