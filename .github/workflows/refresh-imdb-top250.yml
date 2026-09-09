@@ -24,12 +24,15 @@ jobs:
       - name: Install dependencies
         run: pip install httpx beautifulsoup4
 
+      - name: Test movie identity matching
+        run: python -m unittest discover -s scripts -p 'test_*.py' -v
+
       - name: Refresh top250 and sync Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATA_SOURCE_ID: ${{ secrets.NOTION_DATA_SOURCE_ID }}
           OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
-        run: python scripts/refresh_top250.py
+        run: python scripts/refresh_top250_with_identity.py
 
       - name: Commit updated cache
         run: |
