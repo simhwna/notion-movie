@@ -1,14 +1,14 @@
 {
-  "rows": 297,
-  "matchedById": 247,
+  "rows": 231,
+  "matchedById": 169,
   "matchedByTitle": 0,
   "matchedByWikidata": 0,
-  "outsideChart": 50,
+  "outsideChart": 62,
   "invalidId": 0,
   "ambiguous": 0,
   "unresolved": 0,
-  "updated": 65,
+  "updated": 22,
   "updateFailed": 0,
   "wikidataLookups": 0,
-  "omdbCalls": 50
+  "omdbCalls": 62
 }
